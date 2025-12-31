@@ -119,6 +119,23 @@ struct ProvisioningProfile {
         Log.write("Updated application-identifier from '\(oldIdentifier)' to '\(newIdentifier)'")
         // TODO: update any other wildcard entitlements
     }
+
+    mutating func mergeEntitlements(from filePath: String) {
+        guard let customEntitlements = NSDictionary(contentsOfFile: filePath) as? [String: AnyObject] else {
+            Log.write("Error reading custom entitlements from file: \(filePath)")
+            return
+        }
+
+        for (key, value) in customEntitlements {
+            if entitlements[key] != nil {
+                Log.write("Overriding entitlement '\(key)' with custom value")
+            } else {
+                Log.write("Adding custom entitlement '\(key)'")
+            }
+            entitlements[key] = value
+        }
+        Log.write("Successfully merged \(customEntitlements.count) custom entitlement(s)")
+    }
     
     func getEntitlementsPlist() -> String? {
         let data = PropertyListSerialization.dataFromPropertyList(entitlements, format: PropertyListSerialization.PropertyListFormat.xml, errorDescription: nil)!

@@ -31,6 +31,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     var provisioningProfiles:[ProvisioningProfile] = []
     @objc var codesigningCerts: [String] = []
     @objc var profileFilename: String?
+    @objc var customEntitlementsFile: String?
     @objc var ReEnableNewApplicationID = false
     @objc var PreviousNewApplicationID = ""
     @objc var outputFile: String?
@@ -58,7 +59,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     //MARK: Drag / Drop
     static let urlFileTypes = ["ipa", "deb"]
     static let allowedFileTypes = urlFileTypes + ["app", "appex", "xcarchive"]
-    static let fileTypes = allowedFileTypes + ["mobileprovision"]
+    static let fileTypes = allowedFileTypes + ["mobileprovision", "plist", "json"]
     @objc var fileTypeIsOk = false
     
     @objc func fileDropped(_ filename: String){
@@ -68,6 +69,9 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         case "mobileprovision":
             ProvisioningProfilesPopup.selectItem(at: 1)
             checkProfileID(ProvisioningProfile(filename: filename))
+        case "plist", "json":
+            self.customEntitlementsFile = filename
+            setStatus("Selected custom entitlements: \(filename.lastPathComponent)")
         default:
             break
         }
@@ -875,7 +879,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 //MARK: Generate entitlements.plist
                 if provisioningFile != nil || useAppBundleProfile {
                     setStatus("Parsing entitlements")
-                    
+
                     if var profile = ProvisioningProfile(filename: useAppBundleProfile ? appBundleProvisioningFilePath : provisioningFile!){
                         if shouldSkipGetTaskAllow {
                             profile.removeGetTaskAllow()
@@ -895,6 +899,17 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                             return
                         }
 
+                        // Merge custom entitlements if a file is selected
+                        if let customEntitlementsPath = self.customEntitlementsFile {
+                            if fileManager.fileExists(atPath: customEntitlementsPath) {
+                                setStatus("Merging custom entitlements from \(customEntitlementsPath.lastPathComponent)")
+                                profile.mergeEntitlements(from: customEntitlementsPath)
+                            } else {
+                                setStatus("Warning: Custom entitlements file not found: \(customEntitlementsPath)")
+                                warnings += 1
+                            }
+                        }
+
                         if let entitlements = profile.getEntitlementsPlist() {
                             Log.write("–––––––––––––––––––––––\n\(entitlements)")
                             Log.write("–––––––––––––––––––––––")
@@ -912,7 +927,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                         setStatus("Unable to parse provisioning profile, it may be corrupt")
                         warnings += 1
                     }
-                    
+
                 }
                 
                 //MARK: Make sure that the executable is well... executable.
@@ -1180,6 +1195,24 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             }
         }
     }
-    
+
+    @objc func chooseCustomEntitlementsFile() {
+        let openDialog = NSOpenPanel()
+        openDialog.canChooseFiles = true
+        openDialog.canChooseDirectories = false
+        openDialog.allowsMultipleSelection = false
+        openDialog.allowsOtherFileTypes = false
+        openDialog.allowedFileTypes = ["plist", "json"]
+        openDialog.message = "Choose custom entitlements file (plist or json)"
+        openDialog.runModal()
+        if let filename = openDialog.urls.first {
+            self.customEntitlementsFile = filename.path
+            setStatus("Selected custom entitlements: \(filename.lastPathComponent)")
+        } else {
+            self.customEntitlementsFile = nil
+            setStatus("No custom entitlements file selected")
+        }
+    }
+
 }
 

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Example custom entitlements -->
+	<!-- Add or modify entitlements here as needed -->
+
+	<!-- Enable push notifications -->
+	<key>aps-environment</key>
+	<string>production</string>
+
+	<!-- Enable associated domains -->
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:example.com</string>
+		<string>applinks:www.example.com</string>
+	</array>
+
+	<!-- Enable HealthKit -->
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+
+	<!-- Enable Keychain Sharing -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.example.myapp</string>
+	</array>
+
+	<!-- Add your own custom entitlements below -->
+
+</dict>
+</plist>

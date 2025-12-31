@@ -107,6 +107,12 @@
                                     <action selector="viewLog:" target="aMe-uV-AHx" id="jXh-hs-BpO"/>
                                 </connections>
                             </menuItem>
+                            <menuItem title="Choose Custom Entitlements..." id="cus-ent-menu">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="chooseCustomEntitlements:" target="aMe-uV-AHx" id="cus-ent-action"/>
+                                </connections>
+                            </menuItem>
                         </items>
                     </menu>
                 </menuItem>

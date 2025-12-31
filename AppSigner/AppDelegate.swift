@@ -41,6 +41,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @IBAction func viewLog(_ sender: AnyObject) {
         NSWorkspace.shared.openFile(Log.logName)
     }
+
+    @IBAction func chooseCustomEntitlements(_ sender: NSMenuItem) {
+        mainView.chooseCustomEntitlementsFile()
+    }
+
     @IBAction func checkForUpdates(_ sender: NSMenuItem) {
         UpdatesController.checkForUpdate(forceShow: true)
         func updateCheckStatus(_ status: Bool, data: Data?, response: URLResponse?, error: Error?){
