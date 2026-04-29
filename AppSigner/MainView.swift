@@ -10,7 +10,40 @@ import Cocoa
 import Foundation
 
 class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDownloadDelegate {
-    
+    enum OperationMode: String {
+        case resign = "Re-Sign IPA"
+        case upload = "Upload IPA"
+        case testflight = "TestFlight"
+
+        var localizedTitle: String {
+            switch self {
+            case .resign:
+                return MainView.localized("mode.resign", "重签名 IPA")
+            case .upload:
+                return MainView.localized("mode.upload", "上传 IPA")
+            case .testflight:
+                return MainView.localized("mode.testflight", "TestFlight 分发")
+            }
+        }
+    }
+
+    struct BetaGroupResult {
+        let groupID: String
+        let groupName: String
+        let publicLink: String?
+        let wasCreated: Bool
+        let linkWasEnabled: Bool
+        let buildAttached: Bool
+        let betaReviewSubmitted: Bool
+        let betaReviewState: String?
+    }
+
+    struct IPAInfo {
+        let bundleID: String
+        let shortVersion: String
+        let buildVersion: String
+    }
+
     //MARK: IBOutlets
     @IBOutlet var ProvisioningProfilesPopup: NSPopUpButton!
     @IBOutlet var CodesigningCertsPopup: NSPopUpButton!
@@ -39,6 +72,14 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     @objc var NibLoaded = false
     var shouldCheckPlugins: Bool!
     var shouldSkipGetTaskAllow: Bool!
+    var operationMode: OperationMode = .resign
+    var modeSelector: NSPopUpButton!
+    var uploadAPIKeyDirectoryField: NSTextField?
+    var uploadConfigurationNameField: NSTextField?
+    var uploadConfigurationPopup: NSPopUpButton?
+    var uploadConfigurationFields: [String: NSTextField] = [:]
+    var uploadManageTestFlightCheckbox: NSButton?
+    var lastTestFlightAutomationError: String?
 
     //MARK: Constants
     let signableExtensions = ["dylib","so","0","vis","pvr","framework","appex","app"]
@@ -55,6 +96,10 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     @objc let securityPath = "/usr/bin/security"
     @objc let chmodPath = "/bin/chmod"
 //    let plistbuddyPath = "/usr/libexec/plistbuddy"
+
+    static func localized(_ key: String, _ fallback: String) -> String {
+        return NSLocalizedString(key, tableName: nil, bundle: Bundle.main, value: fallback, comment: "")
+    }
     
     //MARK: Drag / Drop
     static let urlFileTypes = ["ipa", "deb"]
@@ -151,6 +196,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         
         if NibLoaded == false {
             NibLoaded = true
+            adjustWindowLayoutForLocalizedUI()
+            configureModeSelector()
             
             // Do any additional setup after loading the view.
             populateProvisioningProfiles()
@@ -162,6 +209,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 }
             }
             setStatus("Ready")
+            applyOperationMode(.resign)
             if checkXcodeCLI() == false {
                 if #available(OSX 10.10, *) {
                     let _ = installXcodeCLI()
@@ -195,6 +243,27 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         
         return true
     }
+
+    func adjustWindowLayoutForLocalizedUI() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let window = self.window else { return }
+
+            let targetContentHeight: CGFloat = 282
+            let currentContentRect = window.contentRect(forFrameRect: window.frame)
+            guard currentContentRect.height < targetContentHeight else { return }
+
+            let heightDelta = targetContentHeight - currentContentRect.height
+            var frame = window.frame
+            frame.origin.y -= heightDelta
+            frame.size.height += heightDelta
+            window.setFrame(frame, display: true)
+
+            let minSize = NSSize(width: 550, height: targetContentHeight)
+            let maxSize = NSSize(width: 9999, height: targetContentHeight)
+            window.contentMinSize = minSize
+            window.contentMaxSize = maxSize
+        }
+    }
     
     @objc func makeTempFolder()->String?{
         let tempTask = Process().execute(mktempPath, workingDirectory: nil, arguments: ["-d","-t",bundleID!])
@@ -213,6 +282,63 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         else{
             StatusLabel.stringValue = status
             Log.write(status)
+        }
+    }
+
+    func configureModeSelector() {
+        let selector = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 170, height: 26), pullsDown: false)
+        selector.translatesAutoresizingMaskIntoConstraints = false
+        selector.addItems(withTitles: [OperationMode.resign.localizedTitle, OperationMode.upload.localizedTitle, OperationMode.testflight.localizedTitle])
+        selector.target = self
+        selector.action = #selector(changeOperationMode(_:))
+        selector.selectItem(withTitle: OperationMode.resign.localizedTitle)
+        self.addSubview(selector)
+        self.modeSelector = selector
+
+        NSLayoutConstraint.activate([
+            selector.trailingAnchor.constraint(equalTo: StartButton.leadingAnchor, constant: -8),
+            selector.centerYAnchor.constraint(equalTo: StartButton.centerYAnchor),
+            selector.widthAnchor.constraint(equalToConstant: 170)
+        ])
+    }
+
+    @objc func changeOperationMode(_ sender: NSPopUpButton) {
+        if sender.indexOfSelectedItem == 1 {
+            applyOperationMode(.upload)
+        } else if sender.indexOfSelectedItem == 2 {
+            applyOperationMode(.testflight)
+        } else {
+            applyOperationMode(.resign)
+        }
+    }
+
+    func applyOperationMode(_ mode: OperationMode) {
+        operationMode = mode
+        switch mode {
+        case .upload:
+            StartButton.title = MainView.localized("button.upload", "上传")
+        case .testflight:
+            StartButton.title = MainView.localized("button.distribute", "分发")
+        case .resign:
+            StartButton.title = MainView.localized("button.start", "开始")
+        }
+
+        let signingEnabled = mode == .resign
+        ProvisioningProfilesPopup.isEnabled = signingEnabled
+        CodesigningCertsPopup.isEnabled = signingEnabled
+        NewApplicationIDTextField.isEnabled = signingEnabled && ReEnableNewApplicationID
+        appDisplayName.isEnabled = signingEnabled
+        appShortVersion.isEnabled = signingEnabled
+        appVersion.isEnabled = signingEnabled
+        ignorePluginsCheckbox.isEnabled = signingEnabled
+        noGetTaskAllowCheckbox.isEnabled = signingEnabled
+
+        if mode == .upload {
+            setStatus(MainView.localized("status.upload_ready", "上传模式已就绪，签名设置将被忽略。"))
+        } else if mode == .testflight {
+            setStatus(MainView.localized("status.testflight_ready", "TestFlight 分发模式已就绪，请在构建处理完成后执行。"))
+        } else {
+            setStatus(MainView.localized("status.resign_ready", "重签名模式已就绪。"))
         }
     }
     
@@ -299,7 +425,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 setStatus("Added signing certificate \"\(cert)\"")
             }
         } else {
-            showCodesignCertsErrorAlert()
+            setStatus("No codesigning certificates found")
         }
         
     }
@@ -342,12 +468,17 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             if(enabled){
                 InputFileText.isEnabled = true
                 BrowseButton.isEnabled = true
-                ProvisioningProfilesPopup.isEnabled = true
-                CodesigningCertsPopup.isEnabled = true
-                NewApplicationIDTextField.isEnabled = ReEnableNewApplicationID
+                modeSelector.isEnabled = true
+                ProvisioningProfilesPopup.isEnabled = operationMode == .resign
+                CodesigningCertsPopup.isEnabled = operationMode == .resign
+                NewApplicationIDTextField.isEnabled = operationMode == .resign && ReEnableNewApplicationID
                 NewApplicationIDTextField.stringValue = PreviousNewApplicationID
                 StartButton.isEnabled = true
-                appDisplayName.isEnabled = true
+                appDisplayName.isEnabled = operationMode == .resign
+                appShortVersion.isEnabled = operationMode == .resign
+                appVersion.isEnabled = operationMode == .resign
+                ignorePluginsCheckbox.isEnabled = operationMode == .resign
+                noGetTaskAllowCheckbox.isEnabled = operationMode == .resign
             } else {
                 // Backup previous values
                 PreviousNewApplicationID = NewApplicationIDTextField.stringValue
@@ -355,11 +486,16 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
                 
                 InputFileText.isEnabled = false
                 BrowseButton.isEnabled = false
+                modeSelector.isEnabled = false
                 ProvisioningProfilesPopup.isEnabled = false
                 CodesigningCertsPopup.isEnabled = false
                 NewApplicationIDTextField.isEnabled = false
                 StartButton.isEnabled = false
                 appDisplayName.isEnabled = false
+                appShortVersion.isEnabled = false
+                appVersion.isEnabled = false
+                ignorePluginsCheckbox.isEnabled = false
+                noGetTaskAllowCheckbox.isEnabled = false
             }
         }
     }
@@ -414,6 +550,1282 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     }
     func zip(_ inputPath: String, outputFile: String)->AppSignerTaskOutput {
         return Process().execute(zipPath, workingDirectory: inputPath, arguments: ["-qry", outputFile, "."])
+    }
+
+    func defaultUploadValue(forKey key: String) -> String {
+        return defaults.string(forKey: key) ?? ""
+    }
+
+    func uploadConfigurations() -> [[String: String]] {
+        return defaults.array(forKey: "upload.configurations") as? [[String: String]] ?? []
+    }
+
+    func setUploadConfigurations(_ configurations: [[String: String]]) {
+        defaults.set(configurations, forKey: "upload.configurations")
+    }
+
+    func upsertUploadConfiguration(named name: String, values: [String: String]) {
+        var configurations = uploadConfigurations()
+        var updated = values
+        updated["name"] = name
+
+        if let index = configurations.firstIndex(where: { $0["name"] == name }) {
+            configurations[index] = updated
+        } else {
+            configurations.append(updated)
+        }
+        configurations.sort { ($0["name"] ?? "") < ($1["name"] ?? "") }
+        setUploadConfigurations(configurations)
+        refreshUploadConfigurationPopup(selectedName: name)
+    }
+
+    func deleteUploadConfiguration(named name: String) {
+        let filtered = uploadConfigurations().filter { $0["name"] != name }
+        setUploadConfigurations(filtered)
+        refreshUploadConfigurationPopup(selectedName: nil)
+    }
+
+    func refreshUploadConfigurationPopup(selectedName: String?) {
+        guard let popup = uploadConfigurationPopup else { return }
+        popup.removeAllItems()
+        popup.addItem(withTitle: MainView.localized("upload.config.custom", "自定义"))
+        for configuration in uploadConfigurations() {
+            if let name = configuration["name"], !name.isEmpty {
+                popup.addItem(withTitle: name)
+            }
+        }
+        if let selectedName = selectedName, popup.itemTitles.contains(selectedName) {
+            popup.selectItem(withTitle: selectedName)
+        } else {
+            popup.selectItem(at: 0)
+        }
+    }
+
+    func currentUploadConfigurationValues() -> [String: String] {
+        return [
+            "apiKeyID": uploadConfigurationFields["apiKeyID"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "apiIssuerID": uploadConfigurationFields["apiIssuerID"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "apiKeyDirectory": uploadConfigurationFields["apiKeyDirectory"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "ascProvider": uploadConfigurationFields["ascProvider"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "externalGroup": uploadConfigurationFields["externalGroup"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "externalGroupLinkLimit": uploadConfigurationFields["externalGroupLinkLimit"]?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            "manageTestFlight": uploadManageTestFlightCheckbox?.state == .on ? "true" : "false"
+        ]
+    }
+
+    func applyUploadConfigurationValues(_ configuration: [String: String]) {
+        uploadConfigurationFields["apiKeyID"]?.stringValue = configuration["apiKeyID"] ?? ""
+        uploadConfigurationFields["apiIssuerID"]?.stringValue = configuration["apiIssuerID"] ?? ""
+        uploadConfigurationFields["apiKeyDirectory"]?.stringValue = configuration["apiKeyDirectory"] ?? ""
+        uploadConfigurationFields["ascProvider"]?.stringValue = configuration["ascProvider"] ?? ""
+        uploadConfigurationFields["externalGroup"]?.stringValue = configuration["externalGroup"] ?? ""
+        uploadConfigurationFields["externalGroupLinkLimit"]?.stringValue = configuration["externalGroupLinkLimit"] ?? ""
+        uploadConfigurationNameField?.stringValue = configuration["name"] ?? ""
+        let manageTestFlight = configuration["manageTestFlight"] != "false"
+        uploadManageTestFlightCheckbox?.state = manageTestFlight ? .on : .off
+        updateUploadTestFlightOptionsEnabled()
+    }
+
+    func saveUploadConfiguration(_ configuration: [String: String]) {
+        defaults.set(configuration["apiKeyID"], forKey: "upload.apiKeyID")
+        defaults.set(configuration["apiIssuerID"], forKey: "upload.apiIssuerID")
+        defaults.set(configuration["apiKeyDirectory"], forKey: "upload.apiKeyDirectory")
+        defaults.set(configuration["ascProvider"], forKey: "upload.ascProvider")
+        defaults.set(configuration["externalGroup"], forKey: "upload.externalGroup")
+        defaults.set(configuration["externalGroupLinkLimit"], forKey: "upload.externalGroupLinkLimit")
+        defaults.set(configuration["manageTestFlight"], forKey: "upload.manageTestFlight")
+    }
+
+    func promptUploadConfiguration() -> [String: String]? {
+        let alert = NSAlert()
+        alert.messageText = MainView.localized("upload.dialog.title", "上传 IPA")
+        alert.informativeText = MainView.localized("upload.dialog.info", "请选择或编辑已保存配置，此流程仅上传 IPA，不处理 TestFlight 分发。")
+        alert.addButton(withTitle: MainView.localized("button.upload", "上传"))
+        alert.addButton(withTitle: MainView.localized("button.cancel", "取消"))
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 288))
+        uploadConfigurationFields = [:]
+        let labels = [
+            MainView.localized("upload.field.api_key_id", "API Key ID"),
+            MainView.localized("upload.field.issuer_id", "Issuer ID"),
+            MainView.localized("upload.field.api_key_dir", "API Key 目录"),
+            MainView.localized("upload.field.asc_provider", "ASC Provider")
+        ]
+        let fieldKeys = ["apiKeyID", "apiIssuerID", "apiKeyDirectory", "ascProvider"]
+        uploadAPIKeyDirectoryField = nil
+        let labelWidth: CGFloat = 108
+        let fieldX: CGFloat = 122
+        let fullFieldWidth: CGFloat = 368
+        let compactFieldWidth: CGFloat = 286
+        let contentRightEdge = fieldX + fullFieldWidth
+
+        func makeSectionLabel(_ title: String, y: CGFloat) -> NSTextField {
+            let label = NSTextField(labelWithString: title)
+            label.frame = NSRect(x: fieldX, y: y, width: fullFieldWidth, height: 20)
+            label.font = NSFont.boldSystemFont(ofSize: 12)
+            label.textColor = .labelColor
+            return label
+        }
+
+        func makeSeparator(_ y: CGFloat) -> NSBox {
+            let separator = NSBox(frame: NSRect(x: fieldX, y: y, width: fullFieldWidth, height: 1))
+            separator.boxType = .separator
+            return separator
+        }
+
+        let presetLabel = NSTextField(labelWithString: MainView.localized("upload.field.config", "配置:"))
+        presetLabel.frame = NSRect(x: 0, y: 240, width: labelWidth, height: 20)
+        presetLabel.alignment = .right
+        container.addSubview(presetLabel)
+
+        let presetPopup = NSPopUpButton(frame: NSRect(x: fieldX, y: 236, width: 166, height: 26), pullsDown: false)
+        presetPopup.target = self
+        presetPopup.action = #selector(selectUploadConfigurationPreset(_:))
+        container.addSubview(presetPopup)
+        uploadConfigurationPopup = presetPopup
+
+        let newButton = NSButton(frame: NSRect(x: 294, y: 235, width: 52, height: 28))
+        newButton.title = MainView.localized("button.new_short", "新建")
+        newButton.bezelStyle = .rounded
+        newButton.target = self
+        newButton.action = #selector(newUploadConfigurationPreset(_:))
+        container.addSubview(newButton)
+
+        let saveButton = NSButton(frame: NSRect(x: 352, y: 235, width: 82, height: 28))
+        saveButton.title = MainView.localized("button.save_update", "保存更新")
+        saveButton.bezelStyle = .rounded
+        saveButton.target = self
+        saveButton.action = #selector(saveUploadConfigurationPreset(_:))
+        container.addSubview(saveButton)
+
+        let deleteButton = NSButton(frame: NSRect(x: 440, y: 235, width: 50, height: 28))
+        deleteButton.title = MainView.localized("button.delete", "删除")
+        deleteButton.bezelStyle = .rounded
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteUploadConfigurationPreset(_:))
+        container.addSubview(deleteButton)
+
+        let nameLabel = NSTextField(labelWithString: MainView.localized("upload.field.name", "名称:"))
+        nameLabel.frame = NSRect(x: 0, y: 202, width: labelWidth, height: 20)
+        nameLabel.alignment = .right
+        container.addSubview(nameLabel)
+
+        let nameField = NSTextField(frame: NSRect(x: fieldX, y: 198, width: fullFieldWidth, height: 24))
+        nameField.placeholderString = MainView.localized("upload.field.name.placeholder", "配置名称")
+        nameField.lineBreakMode = NSLineBreakMode.byTruncatingTail
+        nameField.cell?.wraps = false
+        nameField.cell?.usesSingleLineMode = true
+        container.addSubview(nameField)
+        uploadConfigurationNameField = nameField
+
+        let basicSectionLabel = makeSectionLabel(MainView.localized("upload.section.basic", "基础上传配置"), y: 164)
+        container.addSubview(basicSectionLabel)
+        container.addSubview(makeSeparator(158))
+
+        for index in 0..<labels.count {
+            let top: CGFloat
+            switch index {
+            case 0:
+                top = 128
+            case 1:
+                top = 94
+            case 2:
+                top = 60
+            case 3:
+                top = 26
+            default:
+                top = 26
+            }
+            let label = NSTextField(labelWithString: labels[index] + ":")
+            label.frame = NSRect(x: 0, y: top, width: labelWidth, height: 20)
+            label.alignment = .right
+            container.addSubview(label)
+
+            let usesBrowseButton = fieldKeys[index] == "apiKeyDirectory"
+            let fieldWidth: CGFloat = usesBrowseButton ? compactFieldWidth : fullFieldWidth
+            let field = NSTextField(frame: NSRect(x: fieldX, y: top - 2, width: fieldWidth, height: 24))
+            field.lineBreakMode = NSLineBreakMode.byTruncatingTail
+            field.cell?.wraps = false
+            field.cell?.usesSingleLineMode = true
+            if fieldKeys[index] == "ascProvider" {
+                field.placeholderString = MainView.localized("placeholder.optional", "可选")
+            } else if fieldKeys[index] == "apiKeyDirectory" {
+                field.placeholderString = MainView.localized("upload.field.api_key_dir.placeholder", "包含 AuthKey_<KEYID>.p8 的目录")
+            }
+            container.addSubview(field)
+            uploadConfigurationFields[fieldKeys[index]] = field
+
+            if usesBrowseButton {
+                uploadAPIKeyDirectoryField = field
+                let browseButton = NSButton(frame: NSRect(x: contentRightEdge - 76, y: top - 3, width: 76, height: 26))
+                browseButton.title = MainView.localized("button.browse", "浏览")
+                browseButton.bezelStyle = .rounded
+                browseButton.target = self
+                browseButton.action = #selector(browseUploadAPIKeyDirectory(_:))
+                container.addSubview(browseButton)
+            }
+        }
+
+        uploadManageTestFlightCheckbox = nil
+
+        refreshUploadConfigurationPopup(selectedName: nil)
+        let lastConfiguration = [
+            "apiKeyID": defaultUploadValue(forKey: "upload.apiKeyID"),
+            "apiIssuerID": defaultUploadValue(forKey: "upload.apiIssuerID"),
+            "apiKeyDirectory": defaultUploadValue(forKey: "upload.apiKeyDirectory"),
+            "ascProvider": defaultUploadValue(forKey: "upload.ascProvider"),
+            "manageTestFlight": "false"
+        ]
+        applyUploadConfigurationValues(lastConfiguration)
+
+        alert.accessoryView = container
+        while true {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                guard let config = validatedUploadConfiguration() else {
+                    continue
+                }
+                return config
+            }
+            return nil
+        }
+    }
+
+    func promptTestFlightConfiguration() -> [String: String]? {
+        let alert = NSAlert()
+        alert.messageText = MainView.localized("testflight.dialog.title", "TestFlight 分发")
+        alert.informativeText = MainView.localized("testflight.dialog.info", "请选择已保存配置，然后将已处理完成的构建挂到外部测试组并自动提交外测审核。")
+        alert.addButton(withTitle: MainView.localized("button.distribute", "分发"))
+        alert.addButton(withTitle: MainView.localized("button.cancel", "取消"))
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 296))
+        uploadConfigurationFields = [:]
+        let labels = [
+            MainView.localized("upload.field.api_key_id", "API Key ID"),
+            MainView.localized("upload.field.issuer_id", "Issuer ID"),
+            MainView.localized("upload.field.api_key_dir", "API Key 目录"),
+            MainView.localized("upload.field.external_group", "外部测试组"),
+            MainView.localized("upload.field.link_limit", "链接人数上限")
+        ]
+        let fieldKeys = ["apiKeyID", "apiIssuerID", "apiKeyDirectory", "externalGroup", "externalGroupLinkLimit"]
+        uploadAPIKeyDirectoryField = nil
+        let labelWidth: CGFloat = 108
+        let fieldX: CGFloat = 122
+        let fullFieldWidth: CGFloat = 368
+        let compactFieldWidth: CGFloat = 286
+        let contentRightEdge = fieldX + fullFieldWidth
+
+        func makeSectionLabel(_ title: String, y: CGFloat) -> NSTextField {
+            let label = NSTextField(labelWithString: title)
+            label.frame = NSRect(x: fieldX, y: y, width: fullFieldWidth, height: 20)
+            label.font = NSFont.boldSystemFont(ofSize: 12)
+            label.textColor = .labelColor
+            return label
+        }
+
+        func makeSeparator(_ y: CGFloat) -> NSBox {
+            let separator = NSBox(frame: NSRect(x: fieldX, y: y, width: fullFieldWidth, height: 1))
+            separator.boxType = .separator
+            return separator
+        }
+
+        let presetLabel = NSTextField(labelWithString: MainView.localized("upload.field.config", "配置:"))
+        presetLabel.frame = NSRect(x: 0, y: 248, width: labelWidth, height: 20)
+        presetLabel.alignment = .right
+        container.addSubview(presetLabel)
+
+        let presetPopup = NSPopUpButton(frame: NSRect(x: fieldX, y: 244, width: 166, height: 26), pullsDown: false)
+        presetPopup.target = self
+        presetPopup.action = #selector(selectUploadConfigurationPreset(_:))
+        container.addSubview(presetPopup)
+        uploadConfigurationPopup = presetPopup
+
+        let newButton = NSButton(frame: NSRect(x: 294, y: 243, width: 52, height: 28))
+        newButton.title = MainView.localized("button.new_short", "新建")
+        newButton.bezelStyle = .rounded
+        newButton.target = self
+        newButton.action = #selector(newUploadConfigurationPreset(_:))
+        container.addSubview(newButton)
+
+        let saveButton = NSButton(frame: NSRect(x: 352, y: 243, width: 82, height: 28))
+        saveButton.title = MainView.localized("button.save_update", "保存更新")
+        saveButton.bezelStyle = .rounded
+        saveButton.target = self
+        saveButton.action = #selector(saveUploadConfigurationPreset(_:))
+        container.addSubview(saveButton)
+
+        let deleteButton = NSButton(frame: NSRect(x: 440, y: 243, width: 50, height: 28))
+        deleteButton.title = MainView.localized("button.delete", "删除")
+        deleteButton.bezelStyle = .rounded
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteUploadConfigurationPreset(_:))
+        container.addSubview(deleteButton)
+
+        let nameLabel = NSTextField(labelWithString: MainView.localized("upload.field.name", "名称:"))
+        nameLabel.frame = NSRect(x: 0, y: 210, width: labelWidth, height: 20)
+        nameLabel.alignment = .right
+        container.addSubview(nameLabel)
+
+        let nameField = NSTextField(frame: NSRect(x: fieldX, y: 206, width: fullFieldWidth, height: 24))
+        nameField.placeholderString = MainView.localized("upload.field.name.placeholder", "配置名称")
+        nameField.lineBreakMode = .byTruncatingTail
+        nameField.cell?.wraps = false
+        nameField.cell?.usesSingleLineMode = true
+        container.addSubview(nameField)
+        uploadConfigurationNameField = nameField
+
+        let basicSectionLabel = makeSectionLabel(MainView.localized("upload.section.basic", "基础上传配置"), y: 172)
+        container.addSubview(basicSectionLabel)
+        container.addSubview(makeSeparator(166))
+
+        for index in 0..<labels.count {
+            let top: CGFloat
+            switch index {
+            case 0:
+                top = 136
+            case 1:
+                top = 102
+            case 2:
+                top = 68
+            case 3:
+                top = 34
+            default:
+                top = 0
+            }
+            let label = NSTextField(labelWithString: labels[index] + ":")
+            label.frame = NSRect(x: 0, y: top, width: labelWidth, height: 20)
+            label.alignment = .right
+            container.addSubview(label)
+
+            let usesBrowseButton = fieldKeys[index] == "apiKeyDirectory"
+            let fieldWidth: CGFloat = usesBrowseButton ? compactFieldWidth : fullFieldWidth
+            let field = NSTextField(frame: NSRect(x: fieldX, y: top - 2, width: fieldWidth, height: 24))
+            field.lineBreakMode = .byTruncatingTail
+            field.cell?.wraps = false
+            field.cell?.usesSingleLineMode = true
+            if fieldKeys[index] == "apiKeyDirectory" {
+                field.placeholderString = MainView.localized("upload.field.api_key_dir.placeholder", "包含 AuthKey_<KEYID>.p8 的目录")
+            } else if fieldKeys[index] == "externalGroup" {
+                field.placeholderString = MainView.localized("upload.field.external_group.placeholder", "必填，用于外部测试组分发")
+            } else if fieldKeys[index] == "externalGroupLinkLimit" {
+                field.placeholderString = MainView.localized("upload.field.link_limit.placeholder", "可选整数")
+            }
+            container.addSubview(field)
+            uploadConfigurationFields[fieldKeys[index]] = field
+
+            if usesBrowseButton {
+                uploadAPIKeyDirectoryField = field
+                let browseButton = NSButton(frame: NSRect(x: contentRightEdge - 76, y: top - 3, width: 76, height: 26))
+                browseButton.title = MainView.localized("button.browse", "浏览")
+                browseButton.bezelStyle = .rounded
+                browseButton.target = self
+                browseButton.action = #selector(browseUploadAPIKeyDirectory(_:))
+                container.addSubview(browseButton)
+            }
+        }
+
+        refreshUploadConfigurationPopup(selectedName: nil)
+        let lastConfiguration = [
+            "apiKeyID": defaultUploadValue(forKey: "upload.apiKeyID"),
+            "apiIssuerID": defaultUploadValue(forKey: "upload.apiIssuerID"),
+            "apiKeyDirectory": defaultUploadValue(forKey: "upload.apiKeyDirectory"),
+            "ascProvider": defaultUploadValue(forKey: "upload.ascProvider"),
+            "externalGroup": defaultUploadValue(forKey: "upload.externalGroup"),
+            "externalGroupLinkLimit": defaultUploadValue(forKey: "upload.externalGroupLinkLimit"),
+            "manageTestFlight": "true"
+        ]
+        applyUploadConfigurationValues(lastConfiguration)
+
+        alert.accessoryView = container
+        while true {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                guard let config = validatedUploadConfiguration(requireExternalGroup: true) else {
+                    continue
+                }
+                return config
+            }
+            return nil
+        }
+    }
+
+    func validatedUploadConfiguration(requireExternalGroup: Bool = false) -> [String: String]? {
+        let currentValues = currentUploadConfigurationValues()
+        let apiKeyID = currentValues["apiKeyID"] ?? ""
+        let apiIssuerID = currentValues["apiIssuerID"] ?? ""
+        let apiKeyDirectory = currentValues["apiKeyDirectory"] ?? ""
+        let ascProvider = currentValues["ascProvider"] ?? ""
+        let externalGroup = currentValues["externalGroup"] ?? ""
+        let externalGroupLinkLimit = currentValues["externalGroupLinkLimit"] ?? ""
+        let manageTestFlight = currentValues["manageTestFlight"] ?? "true"
+
+        guard !apiKeyID.isEmpty, !apiIssuerID.isEmpty, !apiKeyDirectory.isEmpty else {
+            let errorAlert = NSAlert()
+            errorAlert.messageText = MainView.localized("upload.error.missing_config.title", "缺少上传配置")
+            errorAlert.informativeText = MainView.localized("upload.error.missing_config.info", "API Key ID、Issuer ID 和 API Key 目录为必填项。")
+            errorAlert.runModal()
+            return nil
+        }
+
+        if requireExternalGroup && externalGroup.isEmpty {
+            let errorAlert = NSAlert()
+            errorAlert.messageText = MainView.localized("upload.error.group_required.title", "缺少外部测试组")
+            errorAlert.informativeText = MainView.localized("upload.error.group_required.info", "测试外部分组流程时，必须填写“外部测试组”。")
+            errorAlert.runModal()
+            return nil
+        }
+
+        let config = [
+            "apiKeyID": apiKeyID,
+            "apiIssuerID": apiIssuerID,
+            "apiKeyDirectory": apiKeyDirectory,
+            "ascProvider": ascProvider,
+            "externalGroup": externalGroup,
+            "externalGroupLinkLimit": externalGroupLinkLimit,
+            "manageTestFlight": manageTestFlight
+        ]
+        saveUploadConfiguration(config)
+        return config
+    }
+
+    func testExternalGroupFlow(configuration: [String: String]) {
+        let inputFile = InputFileText.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inputFile.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("upload.test.error.no_input.title", "缺少输入 IPA")
+            alert.informativeText = MainView.localized("upload.test.error.no_input.info", "请先在主界面选择一个本地 IPA，用它来识别 Bundle ID 和 build 信息。")
+            alert.runModal()
+            return
+        }
+
+        if inputFile.lowercased().hasPrefix("http") {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("upload.test.error.http_not_supported.title", "测试流程暂不支持远程 IPA")
+            alert.informativeText = MainView.localized("upload.test.error.http_not_supported.info", "请先选择一个本地 IPA，再测试外部分组流程。")
+            alert.runModal()
+            return
+        }
+
+        var inputIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: inputFile, isDirectory: &inputIsDirectory), !inputIsDirectory.boolValue, inputFile.pathExtension.lowercased() == "ipa" else {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("upload.test.error.invalid_ipa.title", "请输入有效的本地 IPA")
+            alert.informativeText = MainView.localized("upload.test.error.invalid_ipa.info", "测试外部分组流程时，主界面输入文件必须是一个本地 IPA。")
+            alert.runModal()
+            return
+        }
+
+        guard let tempFolder = makeTempFolder() else {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("upload.test.error.temp.title", "无法创建临时目录")
+            alert.informativeText = MainView.localized("upload.test.error.temp.info", "测试外部分组流程时，创建临时目录失败。")
+            alert.runModal()
+            return
+        }
+
+        defer {
+            try? fileManager.removeItem(atPath: tempFolder)
+        }
+
+        setStatus(MainView.localized("upload.test.status.inspecting", "正在分析 IPA 并测试外部分组"))
+        guard let info = ipaInfo(inputFile, tempFolder: tempFolder) else {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("upload.test.error.inspect_failed.title", "无法读取 IPA 信息")
+            alert.informativeText = MainView.localized("upload.test.error.inspect_failed.info", "未能从当前 IPA 读取 Bundle ID、版本号或构建号。")
+            alert.runModal()
+            return
+        }
+
+        if let result = ensureExternalGroupPublicLink(ipaInfo: info, configuration: configuration) {
+            var lines: [String] = []
+            lines.append(MainView.localized("upload.result.external_group", "外部测试组") + ": \(result.groupName)")
+            lines.append(result.wasCreated ? MainView.localized("upload.result.group_created", "测试组操作: 已创建") : MainView.localized("upload.result.group_reused", "测试组操作: 复用已有"))
+            lines.append(result.linkWasEnabled ? MainView.localized("upload.result.link_created", "公开链接操作: 已创建/启用") : MainView.localized("upload.result.link_reused", "公开链接操作: 复用已有"))
+            lines.append(result.buildAttached ? MainView.localized("upload.result.build_attached", "构建操作: 已挂到测试组") : MainView.localized("upload.result.build_not_attached", "构建操作: 尚未挂到测试组"))
+            if result.buildAttached {
+                if let betaReviewState = result.betaReviewState, !betaReviewState.isEmpty {
+                    lines.append((result.betaReviewSubmitted ? MainView.localized("upload.result.beta_review_submitted", "外测审核操作: 已提交") : MainView.localized("upload.result.beta_review_existing", "外测审核操作: 已存在")) + " (\(betaReviewState))")
+                } else {
+                    lines.append(result.betaReviewSubmitted ? MainView.localized("upload.result.beta_review_submitted", "外测审核操作: 已提交") : MainView.localized("upload.result.beta_review_existing", "外测审核操作: 已存在"))
+                }
+            }
+            if let publicLink = result.publicLink, !publicLink.isEmpty {
+                lines.append(MainView.localized("upload.result.public_link", "公开链接") + ": \(publicLink)")
+            }
+            if !result.buildAttached, let lastError = lastTestFlightAutomationError, !lastError.isEmpty {
+                lines.append(MainView.localized("upload.test.result.detail", "详细信息") + ": \(lastError)")
+            }
+
+            presentResultAlert(
+                title: MainView.localized("upload.test.result.title", "外部分组测试完成"),
+                message: lines.joined(separator: "\n"),
+                publicLink: result.publicLink
+            )
+            setStatus(MainView.localized("upload.test.result.short", "外部分组测试完成"))
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = MainView.localized("upload.test.result.failed.title", "外部分组测试失败")
+        alert.informativeText = lastTestFlightAutomationError ?? MainView.localized("upload.result.group_incomplete", "外部测试组自动化未完成，请查看日志了解详情。")
+        alert.alertStyle = .warning
+        alert.runModal()
+        setStatus(MainView.localized("upload.test.result.failed.short", "外部分组测试失败"))
+    }
+
+    @objc func selectUploadConfigurationPreset(_ sender: NSPopUpButton) {
+        let customTitle = MainView.localized("upload.config.custom", "自定义")
+        let selected = sender.titleOfSelectedItem ?? customTitle
+        guard selected != customTitle else { return }
+        if let configuration = uploadConfigurations().first(where: { $0["name"] == selected }) {
+            applyUploadConfigurationValues(configuration)
+        }
+    }
+
+    @objc func newUploadConfigurationPreset(_ sender: Any?) {
+        uploadConfigurationPopup?.selectItem(at: 0)
+        uploadConfigurationNameField?.stringValue = ""
+        applyUploadConfigurationValues([:])
+    }
+
+    @objc func saveUploadConfigurationPreset(_ sender: Any?) {
+        let name = uploadConfigurationNameField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        var values = currentUploadConfigurationValues()
+        values["name"] = name
+        upsertUploadConfiguration(named: name, values: values)
+    }
+
+    @objc func deleteUploadConfigurationPreset(_ sender: Any?) {
+        let name = uploadConfigurationNameField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        deleteUploadConfiguration(named: name)
+        uploadConfigurationNameField?.stringValue = ""
+        applyUploadConfigurationValues([:])
+    }
+
+    @objc func browseUploadAPIKeyDirectory(_ sender: Any?) {
+        let openDialog = NSOpenPanel()
+        openDialog.canChooseFiles = false
+        openDialog.canChooseDirectories = true
+        openDialog.allowsMultipleSelection = false
+        openDialog.canCreateDirectories = false
+        if openDialog.runModal() == .OK, let url = openDialog.urls.first {
+            uploadAPIKeyDirectoryField?.stringValue = url.path
+        }
+    }
+
+    func updateUploadTestFlightOptionsEnabled() {
+        let enabled: Bool
+        if let checkbox = uploadManageTestFlightCheckbox {
+            enabled = checkbox.state == .on
+        } else {
+            enabled = true
+        }
+        uploadConfigurationFields["externalGroup"]?.isEnabled = enabled
+        uploadConfigurationFields["externalGroupLinkLimit"]?.isEnabled = enabled
+    }
+
+    @objc func toggleUploadTestFlightOptions(_ sender: Any?) {
+        updateUploadTestFlightOptionsEnabled()
+    }
+
+    func handleUploadLogLine(_ line: String) {
+        Log.write(line)
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return }
+
+        if trimmed.contains("Running altool") {
+            setStatus(MainView.localized("upload.status.running_altool", "正在运行 altool"))
+        } else if trimmed.contains("No errors uploading") || trimmed.contains("Upload successful") {
+            setStatus(MainView.localized("upload.status.completed", "上传完成"))
+        } else if trimmed.contains("ERROR:") || trimmed.contains("Failed to upload") || trimmed.contains("ExitFailure") {
+            setStatus(MainView.localized("upload.status.error", "上传出错"))
+        } else {
+            let shortened = trimmed.count > 120 ? String(trimmed.prefix(120)) + "..." : trimmed
+            setStatus(shortened)
+        }
+    }
+
+    func uploadIPA(_ ipaPath: String, configuration: [String: String]) -> AppSignerTaskOutput {
+        var environment = ProcessInfo.processInfo.environment
+        environment["API_PRIVATE_KEYS_DIR"] = configuration["apiKeyDirectory"]
+        let task = Process()
+        task.environment = environment
+        var arguments = [
+            "altool",
+            "--upload-app",
+            "--type", "ios",
+            "--file", ipaPath,
+            "--apiKey", configuration["apiKeyID"] ?? "",
+            "--apiIssuer", configuration["apiIssuerID"] ?? ""
+        ]
+        if let ascProvider = configuration["ascProvider"], !ascProvider.isEmpty {
+            arguments += ["--asc-provider", ascProvider]
+        }
+        return task.executeStreaming("/usr/bin/xcrun", workingDirectory: nil, arguments: arguments) { line in
+            self.handleUploadLogLine(line)
+        }
+    }
+
+    func base64URL(_ data: Data) -> String {
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    func readASN1Length(_ bytes: [UInt8], index: inout Int) -> Int? {
+        guard index < bytes.count else { return nil }
+        let first = Int(bytes[index])
+        index += 1
+        if first & 0x80 == 0 {
+            return first
+        }
+
+        let byteCount = first & 0x7f
+        guard byteCount > 0, index + byteCount <= bytes.count else { return nil }
+        var length = 0
+        for _ in 0..<byteCount {
+            length = (length << 8) | Int(bytes[index])
+            index += 1
+        }
+        return length
+    }
+
+    func normalizeECDSAInteger(_ bytes: ArraySlice<UInt8>) -> [UInt8]? {
+        var value = Array(bytes)
+        while value.count > 1 && value.first == 0 {
+            value.removeFirst()
+        }
+        guard value.count <= 32 else { return nil }
+        if value.count < 32 {
+            value = Array(repeating: 0, count: 32 - value.count) + value
+        }
+        return value
+    }
+
+    func convertDERSignatureToJOSE(_ derSignature: Data) -> Data? {
+        let bytes = [UInt8](derSignature)
+        var index = 0
+
+        guard index < bytes.count, bytes[index] == 0x30 else {
+            Log.write("Invalid DER signature: missing sequence")
+            return nil
+        }
+        index += 1
+
+        guard let sequenceLength = readASN1Length(bytes, index: &index),
+              index + sequenceLength <= bytes.count else {
+            Log.write("Invalid DER signature: bad sequence length")
+            return nil
+        }
+
+        guard index < bytes.count, bytes[index] == 0x02 else {
+            Log.write("Invalid DER signature: missing R integer")
+            return nil
+        }
+        index += 1
+
+        guard let rLength = readASN1Length(bytes, index: &index),
+              index + rLength <= bytes.count else {
+            Log.write("Invalid DER signature: bad R length")
+            return nil
+        }
+        let rBytes = bytes[index..<(index + rLength)]
+        index += rLength
+
+        guard index < bytes.count, bytes[index] == 0x02 else {
+            Log.write("Invalid DER signature: missing S integer")
+            return nil
+        }
+        index += 1
+
+        guard let sLength = readASN1Length(bytes, index: &index),
+              index + sLength <= bytes.count else {
+            Log.write("Invalid DER signature: bad S length")
+            return nil
+        }
+        let sBytes = bytes[index..<(index + sLength)]
+
+        guard
+            let normalizedR = normalizeECDSAInteger(rBytes),
+            let normalizedS = normalizeECDSAInteger(sBytes)
+        else {
+            Log.write("Invalid DER signature: unable to normalize R/S values")
+            return nil
+        }
+
+        return Data(normalizedR + normalizedS)
+    }
+
+    func signJWTInput(_ input: Data, privateKeyPath: String) -> Data? {
+        let process = Process()
+        process.launchPath = "/usr/bin/openssl"
+        process.arguments = ["dgst", "-sha256", "-binary", "-sign", privateKeyPath]
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        process.launch()
+        stdinPipe.fileHandleForWriting.write(input)
+        stdinPipe.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            if let errorText = String(data: errorData, encoding: .utf8) {
+                Log.write("OpenSSL sign error: \(errorText)")
+            }
+            return nil
+        }
+
+        let derSignature = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        return convertDERSignatureToJOSE(derSignature)
+    }
+
+    func generateAppStoreConnectJWT(configuration: [String: String]) -> String? {
+        guard
+            let keyID = configuration["apiKeyID"], !keyID.isEmpty,
+            let issuerID = configuration["apiIssuerID"], !issuerID.isEmpty,
+            let apiKeyDirectory = configuration["apiKeyDirectory"], !apiKeyDirectory.isEmpty
+        else {
+            return nil
+        }
+
+        let privateKeyPath = (apiKeyDirectory as NSString).appendingPathComponent("AuthKey_\(keyID).p8")
+        guard fileManager.fileExists(atPath: privateKeyPath) else {
+            Log.write("API private key not found: \(privateKeyPath)")
+            return nil
+        }
+
+        let header: [String: Any] = ["alg": "ES256", "kid": keyID, "typ": "JWT"]
+        let payload: [String: Any] = [
+            "iss": issuerID,
+            "aud": "appstoreconnect-v1",
+            "exp": Int(Date().timeIntervalSince1970) + 20 * 60
+        ]
+
+        guard
+            let headerData = try? JSONSerialization.data(withJSONObject: header, options: []),
+            let payloadData = try? JSONSerialization.data(withJSONObject: payload, options: [])
+        else {
+            return nil
+        }
+
+        let signingInput = "\(base64URL(headerData)).\(base64URL(payloadData))"
+        guard let signature = signJWTInput(signingInput.data(using: .utf8)!, privateKeyPath: privateKeyPath) else {
+            return nil
+        }
+        return signingInput + "." + base64URL(signature)
+    }
+
+    func appStoreConnectRequest(url: URL, method: String, token: String, body: Data? = nil) -> (Int, Data?, String?) {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var responseData: Data?
+        var responseCode = 0
+        var responseError: String?
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            responseData = data
+            if let http = response as? HTTPURLResponse {
+                responseCode = http.statusCode
+            }
+            if let error = error {
+                responseError = error.localizedDescription
+            }
+            semaphore.signal()
+        }.resume()
+
+        semaphore.wait()
+        return (responseCode, responseData, responseError)
+    }
+
+    func appStoreConnectErrorMessage(statusCode: Int, data: Data?, fallback: String) -> String {
+        guard let object = jsonObject(data),
+              let errors = object["errors"] as? [[String: Any]],
+              !errors.isEmpty else {
+            return "\(fallback)（HTTP \(statusCode)）"
+        }
+
+        let lines = errors.compactMap { error -> String? in
+            let code = error["code"] as? String
+            let title = error["title"] as? String
+            let detail = error["detail"] as? String
+            let parts = [code, title, detail].compactMap { value -> String? in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            guard !parts.isEmpty else { return nil }
+            return parts.joined(separator: " | ")
+        }
+
+        if lines.isEmpty {
+            return "\(fallback)（HTTP \(statusCode)）"
+        }
+        return "\(fallback)（HTTP \(statusCode)）\n" + lines.joined(separator: "\n")
+    }
+
+    func jsonObject(_ data: Data?) -> [String: Any]? {
+        guard let data = data else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+    }
+
+    func ipaInfo(_ ipaPath: String, tempFolder: String) -> IPAInfo? {
+        let extractPath = tempFolder.stringByAppendingPathComponent("upload-inspect")
+        do {
+            try fileManager.createDirectory(atPath: extractPath, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            return nil
+        }
+
+        let unzipResult = unzip(ipaPath, outputPath: extractPath)
+        if unzipResult.status != 0 {
+            Log.write("Unable to inspect IPA: \(unzipResult.output)")
+            return nil
+        }
+
+        let payloadPath = extractPath.stringByAppendingPathComponent("Payload")
+        guard let payloadItems = try? fileManager.contentsOfDirectory(atPath: payloadPath) else {
+            return nil
+        }
+
+        for item in payloadItems where item.pathExtension.lowercased() == "app" {
+            let plistPath = payloadPath.stringByAppendingPathComponent(item).stringByAppendingPathComponent("Info.plist")
+            if let bundleID = getPlistKey(plistPath, keyName: "CFBundleIdentifier"),
+               let shortVersion = getPlistKey(plistPath, keyName: "CFBundleShortVersionString"),
+               let buildVersion = getPlistKey(plistPath, keyName: "CFBundleVersion") {
+                return IPAInfo(bundleID: bundleID, shortVersion: shortVersion, buildVersion: buildVersion)
+            }
+        }
+        return nil
+    }
+
+    func fetchPagedCollection(url: URL, token: String) -> [[String: Any]] {
+        var items: [[String: Any]] = []
+        var nextURL: URL? = url
+
+        while let currentURL = nextURL {
+            let result = appStoreConnectRequest(url: currentURL, method: "GET", token: token)
+            guard result.0 >= 200 && result.0 < 300, let object = jsonObject(result.1) else {
+                lastTestFlightAutomationError = appStoreConnectErrorMessage(
+                    statusCode: result.0,
+                    data: result.1,
+                    fallback: MainView.localized("upload.error.asc_request_failed", "读取 App Store Connect 数据失败")
+                )
+                if let data = result.1, let text = String(data: data, encoding: .utf8) {
+                    Log.write("App Store Connect request failed: \(text)")
+                } else if let error = result.2 {
+                    Log.write("App Store Connect request failed: \(error)")
+                }
+                break
+            }
+            if let data = object["data"] as? [[String: Any]] {
+                items.append(contentsOf: data)
+            }
+            if
+                let links = object["links"] as? [String: Any],
+                let next = links["next"] as? String,
+                let parsedNext = URL(string: next),
+                !next.isEmpty
+            {
+                nextURL = parsedNext
+            } else {
+                nextURL = nil
+            }
+        }
+        return items
+    }
+
+    func appStoreConnectAttributes(_ item: [String: Any]) -> [String: Any] {
+        return item["attributes"] as? [String: Any] ?? [:]
+    }
+
+    func preReleaseVersionID(for appID: String, shortVersion: String, token: String) -> String? {
+        guard
+            let encodedVersion = shortVersion.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+            let url = URL(
+                string: "https://api.appstoreconnect.apple.com/v1/preReleaseVersions?filter[app]=\(appID)&filter[version]=\(encodedVersion)&limit=200"
+            )
+        else {
+            return nil
+        }
+        let items = fetchPagedCollection(url: url, token: token)
+        return items.first?["id"] as? String
+    }
+
+    func findAppID(bundleID: String, token: String) -> String? {
+        guard
+            let encoded = bundleID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+            let url = URL(string: "https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=\(encoded)")
+        else {
+            return nil
+        }
+        let items = fetchPagedCollection(url: url, token: token)
+        return items.first?["id"] as? String
+    }
+
+    func listBetaGroups(appID: String, token: String) -> [[String: Any]] {
+        guard let url = URL(string: "https://api.appstoreconnect.apple.com/v1/apps/\(appID)/betaGroups?limit=200") else {
+            return []
+        }
+        return fetchPagedCollection(url: url, token: token)
+    }
+
+    func hasInternalGroup(_ groups: [[String: Any]]) -> Bool {
+        for group in groups {
+            if (appStoreConnectAttributes(group)["isInternalGroup"] as? Bool) == true {
+                return true
+            }
+        }
+        return false
+    }
+
+    func externalGroup(named name: String, groups: [[String: Any]]) -> [String: Any]? {
+        for group in groups {
+            let attributes = appStoreConnectAttributes(group)
+            if (attributes["isInternalGroup"] as? Bool) == true {
+                continue
+            }
+            if (attributes["name"] as? String) == name {
+                return group
+            }
+        }
+        return nil
+    }
+
+    func createExternalGroup(appID: String, name: String, token: String) -> [String: Any]? {
+        let payload: [String: Any] = [
+            "data": [
+                "type": "betaGroups",
+                "attributes": [
+                    "name": name,
+                    "isInternalGroup": false,
+                    "publicLinkEnabled": false
+                ],
+                "relationships": [
+                    "app": [
+                        "data": [
+                            "type": "apps",
+                            "id": appID
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        guard
+            let url = URL(string: "https://api.appstoreconnect.apple.com/v1/betaGroups"),
+            let body = try? JSONSerialization.data(withJSONObject: payload, options: [])
+        else {
+            return nil
+        }
+        let result = appStoreConnectRequest(url: url, method: "POST", token: token, body: body)
+        guard result.0 >= 200 && result.0 < 300, let object = jsonObject(result.1) else {
+            if let data = result.1, let text = String(data: data, encoding: .utf8) {
+                Log.write("Create beta group failed: \(text)")
+            }
+            lastTestFlightAutomationError = appStoreConnectErrorMessage(
+                statusCode: result.0,
+                data: result.1,
+                fallback: MainView.localized("upload.error.create_group_failed", "创建外部测试组失败")
+            )
+            return nil
+        }
+        return object["data"] as? [String: Any]
+    }
+
+    func findBuild(appID: String, ipaInfo: IPAInfo, token: String) -> [String: Any]? {
+        guard
+            let shortVersionEncoded = ipaInfo.shortVersion.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+            let buildVersionEncoded = ipaInfo.buildVersion.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+            let url = URL(
+                string: "https://api.appstoreconnect.apple.com/v1/builds?filter[app]=\(appID)&filter[preReleaseVersion.version]=\(shortVersionEncoded)&filter[version]=\(buildVersionEncoded)&filter[processingState]=VALID&limit=200"
+            )
+        else {
+            return nil
+        }
+
+        let items = fetchPagedCollection(url: url, token: token)
+        if let firstMatch = items.first {
+            return firstMatch
+        }
+
+        if let preReleaseID = preReleaseVersionID(for: appID, shortVersion: ipaInfo.shortVersion, token: token),
+           let fallbackURL = URL(
+            string: "https://api.appstoreconnect.apple.com/v1/builds?filter[preReleaseVersion]=\(preReleaseID)&filter[version]=\(buildVersionEncoded)&filter[processingState]=VALID&limit=200"
+           ) {
+            let fallbackItems = fetchPagedCollection(url: fallbackURL, token: token)
+            if let firstMatch = fallbackItems.first {
+                return firstMatch
+            }
+        }
+
+        if let latestURL = URL(
+            string: "https://api.appstoreconnect.apple.com/v1/builds?filter[app]=\(appID)&filter[processingState]=VALID&limit=200&sort=-uploadedDate"
+        ) {
+            let latestItems = fetchPagedCollection(url: latestURL, token: token)
+            for item in latestItems {
+                let attributes = appStoreConnectAttributes(item)
+                let version = attributes["version"] as? String
+                if version != ipaInfo.buildVersion {
+                    continue
+                }
+                let relationships = item["relationships"] as? [String: Any]
+                let preRelease = relationships?["preReleaseVersion"] as? [String: Any]
+                let preReleaseData = preRelease?["data"] as? [String: Any]
+                let currentPreReleaseID = preReleaseData?["id"] as? String
+                if let expectedPreReleaseID = preReleaseVersionID(for: appID, shortVersion: ipaInfo.shortVersion, token: token) {
+                    if currentPreReleaseID == expectedPreReleaseID {
+                        return item
+                    }
+                }
+            }
+        }
+
+        Log.write("Unable to find processed build for version \(ipaInfo.shortVersion) (\(ipaInfo.buildVersion))")
+        return nil
+    }
+
+    func addBuildToBetaGroup(groupID: String, buildID: String, token: String) -> Bool {
+        let payload: [String: Any] = [
+            "data": [
+                [
+                    "type": "betaGroups",
+                    "id": groupID
+                ]
+            ]
+        ]
+        guard
+            let url = URL(string: "https://api.appstoreconnect.apple.com/v1/builds/\(buildID)/relationships/betaGroups"),
+            let body = try? JSONSerialization.data(withJSONObject: payload, options: [])
+        else {
+            return false
+        }
+        let result = appStoreConnectRequest(url: url, method: "POST", token: token, body: body)
+        if result.0 >= 200 && result.0 < 300 {
+            return true
+        }
+        if let data = result.1, let text = String(data: data, encoding: .utf8) {
+            Log.write("Add build to beta group failed: \(text)")
+        } else if let error = result.2 {
+            Log.write("Add build to beta group failed: \(error)")
+        }
+        lastTestFlightAutomationError = appStoreConnectErrorMessage(
+            statusCode: result.0,
+            data: result.1,
+            fallback: MainView.localized("upload.error.attach_build_failed", "将构建加入外部测试组失败")
+        )
+        return false
+    }
+
+    func betaReviewSubmission(for buildID: String, token: String) -> [String: Any]? {
+        guard let url = URL(
+            string: "https://api.appstoreconnect.apple.com/v1/builds/\(buildID)/betaAppReviewSubmission"
+        ) else {
+            return nil
+        }
+        let result = appStoreConnectRequest(url: url, method: "GET", token: token)
+        guard result.0 >= 200 && result.0 < 300, let object = jsonObject(result.1) else {
+            if result.0 == 404 {
+                return nil
+            }
+            if let data = result.1, let text = String(data: data, encoding: .utf8) {
+                Log.write("Get beta review submission failed: \(text)")
+            }
+            return nil
+        }
+        return object["data"] as? [String: Any]
+    }
+
+    func submitBuildForBetaReview(buildID: String, token: String) -> [String: Any]? {
+        let payload: [String: Any] = [
+            "data": [
+                "type": "betaAppReviewSubmissions",
+                "relationships": [
+                    "build": [
+                        "data": [
+                            "type": "builds",
+                            "id": buildID
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        guard
+            let url = URL(string: "https://api.appstoreconnect.apple.com/v1/betaAppReviewSubmissions"),
+            let body = try? JSONSerialization.data(withJSONObject: payload, options: [])
+        else {
+            return nil
+        }
+        let result = appStoreConnectRequest(url: url, method: "POST", token: token, body: body)
+        guard result.0 >= 200 && result.0 < 300, let object = jsonObject(result.1) else {
+            if let data = result.1, let text = String(data: data, encoding: .utf8) {
+                Log.write("Submit beta review failed: \(text)")
+            }
+            lastTestFlightAutomationError = appStoreConnectErrorMessage(
+                statusCode: result.0,
+                data: result.1,
+                fallback: MainView.localized("upload.error.submit_beta_review_failed", "提交外部测试审核失败")
+            )
+            return nil
+        }
+        return object["data"] as? [String: Any]
+    }
+
+    func ensureBetaReviewSubmission(buildID: String, token: String) -> (Bool, String?) {
+        if let existing = betaReviewSubmission(for: buildID, token: token) {
+            let state = appStoreConnectAttributes(existing)["betaReviewState"] as? String
+            return (false, state)
+        }
+        if let created = submitBuildForBetaReview(buildID: buildID, token: token) {
+            let state = appStoreConnectAttributes(created)["betaReviewState"] as? String
+            return (true, state)
+        }
+        return (false, nil)
+    }
+
+    func presentResultAlert(title: String, message: String, publicLink: String? = nil) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = message
+            if publicLink != nil {
+                alert.addButton(withTitle: MainView.localized("button.copy_public_link", "复制公开链接"))
+            }
+            alert.addButton(withTitle: MainView.localized("button.ok", "OK"))
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn, let publicLink, !publicLink.isEmpty {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(publicLink, forType: .string)
+                self.setStatus(MainView.localized("upload.result.public_link_copied", "公开链接已复制"))
+            }
+        }
+    }
+
+    func enablePublicLink(groupID: String, token: String, testerLimit: Int?) -> [String: Any]? {
+        var attributes: [String: Any] = ["publicLinkEnabled": true]
+        if let testerLimit = testerLimit {
+            attributes["publicLinkLimitEnabled"] = true
+            attributes["publicLinkLimit"] = testerLimit
+        }
+        let payload: [String: Any] = [
+            "data": [
+                "id": groupID,
+                "type": "betaGroups",
+                "attributes": attributes
+            ]
+        ]
+        guard
+            let url = URL(string: "https://api.appstoreconnect.apple.com/v1/betaGroups/\(groupID)"),
+            let body = try? JSONSerialization.data(withJSONObject: payload, options: [])
+        else {
+            return nil
+        }
+        let result = appStoreConnectRequest(url: url, method: "PATCH", token: token, body: body)
+        guard result.0 >= 200 && result.0 < 300, let object = jsonObject(result.1) else {
+            if let data = result.1, let text = String(data: data, encoding: .utf8) {
+                Log.write("Enable public link failed: \(text)")
+            }
+            lastTestFlightAutomationError = appStoreConnectErrorMessage(
+                statusCode: result.0,
+                data: result.1,
+                fallback: MainView.localized("upload.error.public_link_failed", "启用公开链接失败")
+            )
+            return nil
+        }
+        return object["data"] as? [String: Any]
+    }
+
+    func ensureExternalGroupPublicLink(ipaInfo: IPAInfo, configuration: [String: String]) -> BetaGroupResult? {
+        lastTestFlightAutomationError = nil
+        guard
+            let token = generateAppStoreConnectJWT(configuration: configuration),
+            let appID = findAppID(bundleID: ipaInfo.bundleID, token: token),
+            let groupName = configuration["externalGroup"],
+            !groupName.isEmpty
+        else {
+            if lastTestFlightAutomationError == nil {
+                lastTestFlightAutomationError = MainView.localized("upload.error.app_lookup_failed", "未能根据 Bundle ID 找到 App Store Connect 中的 App，或 API Key 无权访问该 App。")
+            }
+            return nil
+        }
+
+        let groups = listBetaGroups(appID: appID, token: token)
+        guard hasInternalGroup(groups) else {
+            let message = MainView.localized("upload.error.missing_internal_group", "App Store Connect 中必须先存在一个 Internal Testing 组，才能创建 External Testing 组。")
+            Log.write(message)
+            lastTestFlightAutomationError = message
+            return nil
+        }
+
+        var wasCreated = false
+        var linkWasEnabled = false
+        var group = externalGroup(named: groupName, groups: groups)
+        if group == nil {
+            group = createExternalGroup(appID: appID, name: groupName, token: token)
+            wasCreated = true
+        }
+
+        guard let resolvedGroup = group, let groupID = resolvedGroup["id"] as? String else {
+            return nil
+        }
+
+        var attributes = appStoreConnectAttributes(resolvedGroup)
+        var publicLink = attributes["publicLink"] as? String
+        if publicLink == nil || publicLink!.isEmpty {
+            let limit = Int(configuration["externalGroupLinkLimit"] ?? "")
+            if let updated = enablePublicLink(groupID: groupID, token: token, testerLimit: limit) {
+                attributes = appStoreConnectAttributes(updated)
+                publicLink = attributes["publicLink"] as? String
+                linkWasEnabled = true
+            }
+        }
+
+        let buildAttached: Bool
+        var betaReviewSubmitted = false
+        var betaReviewState: String?
+        if let build = findBuild(appID: appID, ipaInfo: ipaInfo, token: token),
+           let buildID = build["id"] as? String {
+            buildAttached = addBuildToBetaGroup(groupID: groupID, buildID: buildID, token: token)
+            if buildAttached {
+                let reviewResult = ensureBetaReviewSubmission(buildID: buildID, token: token)
+                betaReviewSubmitted = reviewResult.0
+                betaReviewState = reviewResult.1
+            }
+        } else {
+            if lastTestFlightAutomationError == nil {
+                lastTestFlightAutomationError = MainView.localized("upload.error.build_not_ready", "构建尚未在 App Store Connect 处理完成，暂时无法挂到外部测试组。")
+            }
+            buildAttached = false
+        }
+
+        return BetaGroupResult(
+            groupID: groupID,
+            groupName: attributes["name"] as? String ?? groupName,
+            publicLink: publicLink,
+            wasCreated: wasCreated,
+            linkWasEnabled: linkWasEnabled,
+            buildAttached: buildAttached,
+            betaReviewSubmitted: betaReviewSubmitted,
+            betaReviewState: betaReviewState
+        )
     }
     
     @objc func cleanup(_ tempFolder: String){
@@ -557,6 +1969,26 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         if (inputFile.count < 4) {
             return
         }
+
+        if operationMode == .upload {
+            guard let uploadConfiguration = promptUploadConfiguration() else {
+                return
+            }
+            outputFile = nil
+            controlsEnabled(false)
+            Thread.detachNewThreadSelector(#selector(self.uploadThread(_:)), toTarget: self, with: uploadConfiguration)
+            return
+        }
+
+        if operationMode == .testflight {
+            guard let distributionConfiguration = promptTestFlightConfiguration() else {
+                return
+            }
+            outputFile = nil
+            controlsEnabled(false)
+            Thread.detachNewThreadSelector(#selector(self.testFlightDistributionThread(_:)), toTarget: self, with: distributionConfiguration)
+            return
+        }
         
         if inputFile.pathExtension.lowercased() == "appex" {
             outputFile = inputFile
@@ -574,6 +2006,205 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         if outputFile != nil {
             controlsEnabled(false)
             Thread.detachNewThreadSelector(#selector(self.signingThread), toTarget: self, with: nil)
+        }
+    }
+
+    @objc func uploadThread(_ object: Any?) {
+        guard let uploadConfiguration = object as? [String: String] else {
+            setStatus(MainView.localized("upload.error.missing_config.short", "缺少上传配置"))
+            controlsEnabled(true)
+            return
+        }
+
+        var inputFile: String = ""
+        DispatchQueue.main.sync {
+            downloadProgress.isHidden = true
+            inputFile = self.InputFileText.stringValue
+        }
+
+        let inputStartsWithHTTP = inputFile.lowercased().hasPrefix("http")
+        var tempFolder: String! = nil
+        if let tmpFolder = makeTempFolder() {
+            tempFolder = tmpFolder
+        } else {
+            setStatus("Error creating temp folder")
+            controlsEnabled(true)
+            return
+        }
+
+        downloading = false
+        downloadError = nil
+        downloadPath = tempFolder.stringByAppendingPathComponent("upload.\(inputFile.pathExtension)")
+
+        if inputStartsWithHTTP {
+            let defaultConfigObject = URLSessionConfiguration.default
+            let defaultSession = Foundation.URLSession(configuration: defaultConfigObject, delegate: self, delegateQueue: OperationQueue.main)
+            if let url = URL(string: inputFile) {
+                downloading = true
+                let downloadTask = defaultSession.downloadTask(with: url)
+                setStatus("Downloading file")
+                DispatchQueue.main.async {
+                    self.downloadProgress.isHidden = false
+                }
+                downloadProgress.startAnimation(nil)
+                downloadTask.resume()
+                defaultSession.finishTasksAndInvalidate()
+            }
+
+            while downloading {
+                usleep(100000)
+            }
+            if downloadError != nil {
+                setStatus("Error downloading file, \(downloadError!.localizedDescription.lowercased())")
+                cleanup(tempFolder); return
+            } else {
+                inputFile = downloadPath
+            }
+        }
+
+        var inputIsDirectory: ObjCBool = false
+        if !fileManager.fileExists(atPath: inputFile, isDirectory: &inputIsDirectory) || inputIsDirectory.boolValue {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.error.file_not_found.title", "未找到 IPA 文件")
+                alert.informativeText = MainView.localized("upload.error.file_not_found.info", "上传模式需要一个本地 IPA 文件。")
+                alert.runModal()
+                self.cleanup(tempFolder)
+            }
+            return
+        }
+
+        if inputFile.pathExtension.lowercased() != "ipa" {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.error.unsupported.title", "不支持的输入文件")
+                alert.informativeText = MainView.localized("upload.error.unsupported.info", "上传模式仅支持 IPA 文件。")
+                alert.runModal()
+                self.cleanup(tempFolder)
+            }
+            return
+        }
+
+        setStatus(MainView.localized("upload.status.uploading", "正在上传 IPA"))
+        let uploadResult = uploadIPA(inputFile, configuration: uploadConfiguration)
+        if uploadResult.status != 0 {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.error.failed.title", "上传失败")
+                alert.informativeText = uploadResult.output
+                alert.alertStyle = .critical
+                alert.runModal()
+                self.setStatus(MainView.localized("upload.error.failed.short", "上传失败"))
+                self.cleanup(tempFolder)
+            }
+            return
+        }
+
+        DispatchQueue.main.async {
+            self.presentResultAlert(
+                title: MainView.localized("upload.result.submitted.title", "上传已提交"),
+                message: MainView.localized("upload.result.submitted.info_only", "IPA 已提交到 App Store Connect / TestFlight。\n\n构建通常需要等待一段时间处理完成，之后请切换到 TestFlight 分发模式再挂到外部测试组。")
+            )
+            self.setStatus(MainView.localized("upload.result.submitted.short", "上传已提交"))
+            self.cleanup(tempFolder)
+        }
+    }
+
+    @objc func testFlightDistributionThread(_ object: Any?) {
+        guard let configuration = object as? [String: String] else {
+            setStatus(MainView.localized("upload.error.missing_config.short", "缺少上传配置"))
+            controlsEnabled(true)
+            return
+        }
+
+        let inputFile: String = DispatchQueue.main.sync {
+            downloadProgress.isHidden = true
+            return self.InputFileText.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if inputFile.isEmpty || inputFile.lowercased().hasPrefix("http") {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.test.error.invalid_ipa.title", "请输入有效的本地 IPA")
+                alert.informativeText = MainView.localized("testflight.error.local_ipa_required", "TestFlight 分发模式需要一个本地 IPA，用于识别 Bundle ID、版本号和构建号。")
+                alert.runModal()
+                self.controlsEnabled(true)
+            }
+            return
+        }
+
+        var inputIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: inputFile, isDirectory: &inputIsDirectory),
+              !inputIsDirectory.boolValue,
+              inputFile.pathExtension.lowercased() == "ipa" else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.test.error.invalid_ipa.title", "请输入有效的本地 IPA")
+                alert.informativeText = MainView.localized("testflight.error.local_ipa_required", "TestFlight 分发模式需要一个本地 IPA，用于识别 Bundle ID、版本号和构建号。")
+                alert.runModal()
+                self.controlsEnabled(true)
+            }
+            return
+        }
+
+        guard let tempFolder = makeTempFolder() else {
+            setStatus(MainView.localized("upload.test.error.temp.title", "无法创建临时目录"))
+            controlsEnabled(true)
+            return
+        }
+
+        defer {
+            try? fileManager.removeItem(atPath: tempFolder)
+            controlsEnabled(true)
+        }
+
+        setStatus(MainView.localized("testflight.status.distributing", "正在处理 TestFlight 分发"))
+        guard let info = ipaInfo(inputFile, tempFolder: tempFolder) else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = MainView.localized("upload.test.error.inspect_failed.title", "无法读取 IPA 信息")
+                alert.informativeText = MainView.localized("upload.test.error.inspect_failed.info", "未能从当前 IPA 读取 Bundle ID、版本号或构建号。")
+                alert.runModal()
+            }
+            return
+        }
+
+        if let result = ensureExternalGroupPublicLink(ipaInfo: info, configuration: configuration) {
+            var lines: [String] = []
+            lines.append(MainView.localized("upload.result.external_group", "外部测试组") + ": \(result.groupName)")
+            lines.append(result.wasCreated ? MainView.localized("upload.result.group_created", "测试组操作: 已创建") : MainView.localized("upload.result.group_reused", "测试组操作: 复用已有"))
+            lines.append(result.linkWasEnabled ? MainView.localized("upload.result.link_created", "公开链接操作: 已创建/启用") : MainView.localized("upload.result.link_reused", "公开链接操作: 复用已有"))
+            lines.append(result.buildAttached ? MainView.localized("upload.result.build_attached", "构建操作: 已挂到测试组") : MainView.localized("upload.result.build_not_attached", "构建操作: 尚未挂到测试组"))
+            if result.buildAttached {
+                if let betaReviewState = result.betaReviewState, !betaReviewState.isEmpty {
+                    lines.append((result.betaReviewSubmitted ? MainView.localized("upload.result.beta_review_submitted", "外测审核操作: 已提交") : MainView.localized("upload.result.beta_review_existing", "外测审核操作: 已存在")) + " (\(betaReviewState))")
+                } else {
+                    lines.append(result.betaReviewSubmitted ? MainView.localized("upload.result.beta_review_submitted", "外测审核操作: 已提交") : MainView.localized("upload.result.beta_review_existing", "外测审核操作: 已存在"))
+                }
+            }
+            if let publicLink = result.publicLink, !publicLink.isEmpty {
+                lines.append(MainView.localized("upload.result.public_link", "公开链接") + ": \(publicLink)")
+            }
+            if !result.buildAttached, let lastError = lastTestFlightAutomationError, !lastError.isEmpty {
+                lines.append(MainView.localized("upload.test.result.detail", "详细信息") + ": \(lastError)")
+            }
+
+            presentResultAlert(
+                title: MainView.localized("testflight.result.title", "TestFlight 分发完成"),
+                message: lines.joined(separator: "\n"),
+                publicLink: result.publicLink
+            )
+            setStatus(MainView.localized("testflight.result.short", "TestFlight 分发完成"))
+            return
+        }
+
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = MainView.localized("testflight.result.failed.title", "TestFlight 分发失败")
+            alert.informativeText = self.lastTestFlightAutomationError ?? MainView.localized("upload.result.group_incomplete", "外部测试组自动化未完成，请查看日志了解详情。")
+            alert.alertStyle = .warning
+            alert.runModal()
+            self.setStatus(MainView.localized("testflight.result.failed.short", "TestFlight 分发失败"))
         }
     }
     
@@ -1168,7 +2799,8 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         openDialog.canChooseDirectories = false
         openDialog.allowsMultipleSelection = false
         openDialog.allowsOtherFileTypes = false
-        openDialog.allowedFileTypes = MainView.allowedFileTypes + MainView.allowedFileTypes.map({ $0.uppercased() })
+        let allowedTypes = operationMode == .upload ? ["ipa"] : MainView.allowedFileTypes
+        openDialog.allowedFileTypes = allowedTypes + allowedTypes.map({ $0.uppercased() })
         openDialog.runModal()
         if let filename = openDialog.urls.first {
             InputFileText.stringValue = filename.path
@@ -1180,7 +2812,10 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     }
     
     @IBAction func doSign(_ sender: NSButton) {
-        if codesigningCerts.count > 0 {
+        if operationMode == .upload {
+            NSApplication.shared.windows[0].makeFirstResponder(self)
+            startSigning()
+        } else if codesigningCerts.count > 0 {
             NSApplication.shared.windows[0].makeFirstResponder(self)
             startSigning()
         } else {
@@ -1215,4 +2850,3 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     }
 
 }
-
